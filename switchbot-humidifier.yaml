@@ -1,0 +1,446 @@
+# Complete example for the SwitchBot W3902310 with V07 mainboard.
+#
+# Read SAFETY.md and complete docs/COMMISSIONING.md before enabling
+# `Wet System Armed`. This configuration directly controls a water appliance.
+
+substitutions:
+  name: switchbot-humidifier
+  friendly_name: SwitchBot Humidifier
+  # The W3902310 has no onboard temperature/humidity sensor. These are optional
+  # Home Assistant entities used by Target Humidity, Auto, and Sleep modes.
+  humidity_sensor: sensor.bedroom_humidity
+  temperature_sensor: sensor.bedroom_temperature
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.0
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(humidifier_hw)->set_wet_system_allowed(id(wet_system_armed).state);
+      - light.turn_off: status_leds
+
+esp32:
+  board: esp32dev
+  variant: ESP32
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [switchbot_humidifier]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Setup"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+
+switchbot_humidifier:
+  id: humidifier_hw
+  # Frequencies and startup delay recovered from the stock firmware.
+  speed_1_frequency: 125
+  speed_2_frequency: 250
+  speed_3_frequency: 400
+  speed_4_frequency: 550
+  wet_start_delay: 8s
+  # Current port value. SwitchBot's public support article says 70 minutes;
+  # exact V0_7 stock timing remains to be measured on the test unit.
+  filter_dry_duration: 55min
+  automatic_filter_drying: true
+  tach_safety: true
+  tach_startup_timeout: 15s
+  minimum_tach_pulses_per_minute: 30
+
+fan:
+  # ESPHome maps speed 1..4 to FloatOutput levels 0.25..1.0. The custom
+  # component converts those levels back to the four recovered frequencies.
+  - platform: speed
+    id: humidifier_fan
+    name: Fan
+    output: humidifier_hw
+    speed_count: 4
+    restore_mode: ALWAYS_OFF
+
+globals:
+  - id: filter_runtime_minutes
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+    update_interval: 5min
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_leds
+    name: Status LEDs
+    pin: GPIO27
+    num_leds: 3
+    rgb_order: GRB
+    chipset: WS2812
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 200ms
+
+switch:
+  # Fresh installs fail closed. This restores a deliberate user choice only
+  # after the first successful commissioning.
+  - platform: template
+    id: wet_system_armed
+    name: Wet System Armed
+    icon: mdi:water-check
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(humidifier_hw)->set_wet_system_allowed(true);
+    turn_off_action:
+      - lambda: id(humidifier_hw)->set_wet_system_allowed(false);
+
+  - platform: template
+    id: automatic_filter_drying
+    name: Automatic Filter Drying
+    icon: mdi:fan-clock
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: id(humidifier_hw)->set_automatic_filter_drying(true);
+    turn_off_action:
+      - lambda: id(humidifier_hw)->set_automatic_filter_drying(false);
+
+number:
+  - platform: template
+    id: target_humidity
+    name: Target Humidity
+    icon: mdi:water-percent
+    device_class: humidity
+    unit_of_measurement: "%"
+    min_value: 40
+    max_value: 70
+    step: 1
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+
+select:
+  # Mode names are an ESPHome/Home Assistant control layer. The local panel
+  # buttons and stock display are not yet decoded.
+  - platform: template
+    id: operating_mode
+    name: Operating Mode
+    icon: mdi:air-humidifier
+    options:
+      - Quiet
+      - Low
+      - Medium
+      - High
+      - Target Humidity
+      - Sleep
+      - Auto
+      - Filter Dry
+    initial_option: Low
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.stop: sleep_step_down
+      - lambda: |-
+          if (x == "Filter Dry") {
+            id(humidifier_fan).turn_off().perform();
+            id(humidifier_hw)->start_filter_dry();
+            return;
+          }
+
+          int speed = 2;
+          if (x == "Quiet") speed = 1;
+          else if (x == "Low") speed = 2;
+          else if (x == "Medium") speed = 3;
+          else if (x == "High") speed = 4;
+
+          auto call = id(humidifier_fan).turn_on();
+          call.set_speed(speed);
+          call.perform();
+          if (x == "Sleep")
+            id(sleep_step_down).execute();
+
+  - platform: template
+    id: panel_brightness
+    name: Panel Brightness
+    icon: mdi:brightness-6
+    entity_category: config
+    options:
+      - Normal
+      - Dim
+      - "Off"
+    initial_option: Normal
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          if (x == "Normal") id(humidifier_hw)->set_panel_brightness(0);
+          else if (x == "Dim") id(humidifier_hw)->set_panel_brightness(1);
+          else id(humidifier_hw)->set_panel_brightness(2);
+
+script:
+  - id: sleep_step_down
+    mode: restart
+    then:
+      - delay: 30min
+      - if:
+          condition:
+            lambda: |-
+              return id(operating_mode).current_option() == "Sleep" &&
+                     id(humidifier_fan).state &&
+                     !std::isfinite(id(room_humidity).state);
+          then:
+            - lambda: |-
+                auto call = id(humidifier_fan).turn_on();
+                call.set_speed(1);
+                call.perform();
+
+interval:
+  # Stock Target/Auto/Sleep behavior, using a paired Home Assistant meter.
+  - interval: 10s
+    then:
+      - lambda: |-
+          const std::string mode = id(operating_mode).current_option().str();
+          const float humidity = id(room_humidity).state;
+
+          if (mode == "Sleep" && std::isfinite(humidity) &&
+              humidity >= 60.0f && id(humidifier_fan).state &&
+              id(humidifier_fan).speed > 1) {
+            auto call = id(humidifier_fan).turn_on();
+            call.set_speed(1);
+            call.perform();
+          }
+
+          if (!std::isfinite(humidity))
+            return;
+
+          // Stock over-humidity protection stops humidification at 70% RH.
+          if (humidity >= 70.0f && id(humidifier_fan).state) {
+            id(humidifier_fan).turn_off().perform();
+            return;
+          }
+
+          if (mode != "Target Humidity" && mode != "Auto")
+            return;
+
+          float target = id(target_humidity).state;
+          if (mode == "Auto") {
+            const float temperature = id(room_temperature).state;
+            if (std::isfinite(temperature)) {
+              if (temperature < 18.0f) target = 65.0f;
+              else if (temperature <= 24.0f) target = 60.0f;
+              else target = 55.0f;
+            } else {
+              target = 60.0f;
+            }
+          }
+
+          if (humidity >= target && id(humidifier_fan).state) {
+            id(humidifier_fan).turn_off().perform();
+          } else if (humidity <= target - 2.0f &&
+                     !id(humidifier_fan).state) {
+            auto call = id(humidifier_fan).turn_on();
+            call.set_speed(2);
+            call.perform();
+          }
+
+  - interval: 1min
+    then:
+      - if:
+          condition:
+            lambda: return id(humidifier_hw)->is_wet_active();
+          then:
+            - lambda: id(filter_runtime_minutes) += 1;
+
+sensor:
+  - platform: homeassistant
+    id: room_humidity
+    entity_id: ${humidity_sensor}
+    internal: true
+
+  - platform: homeassistant
+    id: room_temperature
+    entity_id: ${temperature_sensor}
+    internal: true
+
+  - platform: pulse_counter
+    id: blower_tach
+    name: Blower Tachometer
+    pin:
+      number: GPIO34
+      mode:
+        input: true
+    count_mode:
+      # One clean edge per pulse is sufficient. Stock configured a negative
+      # edge; rising-edge count is equivalent for a stable pulse train.
+      rising_edge: INCREMENT
+      falling_edge: DISABLE
+    internal_filter: 5us
+    update_interval: 5s
+    unit_of_measurement: pulses/min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    on_value:
+      - lambda: id(humidifier_hw)->set_tach_pulses_per_minute(x);
+
+  - platform: template
+    name: Blower Signal Frequency
+    icon: mdi:sine-wave
+    unit_of_measurement: Hz
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: return id(humidifier_hw)->get_speed_frequency();
+
+  - platform: template
+    name: Panel Key Mask
+    icon: mdi:code-braces
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: return static_cast<float>(id(humidifier_hw)->get_panel_key_mask());
+
+  - platform: template
+    name: Filter Runtime
+    icon: mdi:air-filter
+    unit_of_measurement: h
+    accuracy_decimals: 1
+    state_class: total_increasing
+    update_interval: 1min
+    lambda: return id(filter_runtime_minutes) / 60.0f;
+
+  - platform: template
+    name: Filter Dry Remaining
+    icon: mdi:timer-sand
+    unit_of_measurement: min
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(humidifier_hw)->get_filter_dry_remaining_seconds() / 60.0f;
+
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    name: Water Level
+    icon: mdi:waves-arrow-up
+    update_interval: 1s
+    lambda: return std::string(id(humidifier_hw)->get_water_level_name());
+
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      entity_category: diagnostic
+    ssid:
+      name: Connected SSID
+      entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: blower_running
+    name: Blower Running
+    device_class: running
+    lambda: return id(humidifier_hw)->is_blower_running();
+
+  - platform: template
+    id: wet_auxiliaries_active
+    name: Wet Auxiliaries Active
+    device_class: running
+    lambda: return id(humidifier_hw)->is_wet_active();
+
+  - platform: template
+    id: filter_dry_running
+    name: Filter Dry Running
+    device_class: running
+    lambda: return id(humidifier_hw)->is_filter_drying();
+
+  - platform: template
+    id: water_empty
+    name: Water Empty
+    device_class: problem
+    lambda: |-
+      if (!id(humidifier_hw)->has_panel_sample())
+        return {};
+      return id(humidifier_hw)->is_water_empty();
+
+  - platform: template
+    id: tach_fault
+    name: Blower Tach Fault
+    device_class: problem
+    lambda: return id(humidifier_hw)->has_tach_fault();
+    on_press:
+      - fan.turn_off: humidifier_fan
+
+  - platform: template
+    name: Filter Service Due
+    device_class: problem
+    icon: mdi:air-filter
+    lambda: return id(filter_runtime_minutes) >= 14400U;
+
+  - platform: status
+    name: Status
+
+button:
+  - platform: template
+    name: Start Filter Dry
+    icon: mdi:fan-clock
+    on_press:
+      - fan.turn_off: humidifier_fan
+      - lambda: id(humidifier_hw)->start_filter_dry();
+
+  - platform: template
+    name: Stop All Hardware
+    # Software emergency stop; physically disconnect mains for a real fault.
+    icon: mdi:stop-circle-outline
+    entity_category: diagnostic
+    on_press:
+      - fan.turn_off: humidifier_fan
+      - lambda: id(humidifier_hw)->stop_all();
+
+  - platform: template
+    name: Test Short Beep
+    icon: mdi:volume-high
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(humidifier_hw)->beep(80);
+
+  - platform: template
+    name: Reset Filter Runtime
+    icon: mdi:air-filter
+    entity_category: config
+    on_press:
+      - lambda: id(filter_runtime_minutes) = 0;
+
+  - platform: restart
+    name: Restart
+    entity_category: config
+
+  - platform: safe_mode
+    name: Safe Mode Boot
+    entity_category: config
