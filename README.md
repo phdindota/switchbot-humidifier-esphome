@@ -410,8 +410,3 @@ developed collaboratively with OpenAI Codex.
 SwitchBot is a trademark of its owner. This independent project is not
 affiliated with or endorsed by SwitchBot.
 
-## License
-
-No open-source license has been selected yet. Until the repository owner adds
-one, normal copyright restrictions apply. Choose a license before inviting
-third-party reuse or contributions.
